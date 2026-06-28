@@ -12,10 +12,10 @@ from loguru import logger
 from mcp.client.session_group import StreamableHttpParameters
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.evals.transport import EvalTransportParams
 from pipecat.frames.frames import LLMRunFrame
 from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.runner import PipelineRunner
-from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
@@ -30,12 +30,17 @@ from pipecat.services.mcp_service import MCPClient
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.daily.transport import DailyParams
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
+from pipecat.workers.runner import WorkerRunner
 
 load_dotenv(override=True)
 
 # We use lambdas to defer transport parameter creation until the transport
 # type is selected at runtime.
 transport_params = {
+    "eval": lambda: EvalTransportParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+    ),
     "daily": lambda: DailyParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
@@ -112,7 +117,7 @@ Just respond with short sentences when you are carrying out tool calls.
             ]
         )
 
-        task = PipelineTask(
+        worker = PipelineWorker(
             pipeline,
             params=PipelineParams(
                 enable_metrics=True,
@@ -125,16 +130,17 @@ Just respond with short sentences when you are carrying out tool calls.
         async def on_client_connected(transport, client):
             logger.info(f"Client connected: {client}")
             # Kick off the conversation.
-            await task.queue_frames([LLMRunFrame()])
+            await worker.queue_frames([LLMRunFrame()])
 
         @transport.event_handler("on_client_disconnected")
         async def on_client_disconnected(transport, client):
             logger.info(f"Client disconnected")
-            await task.cancel()
+            await worker.cancel()
 
-        runner = PipelineRunner(handle_sigint=runner_args.handle_sigint)
+        runner = WorkerRunner(handle_sigint=runner_args.handle_sigint)
 
-        await runner.run(task)
+        await runner.add_workers(worker)
+        await runner.run()
 
 
 async def bot(runner_args: RunnerArguments):

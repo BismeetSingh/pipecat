@@ -10,13 +10,11 @@ import os
 from dotenv import load_dotenv
 from loguru import logger
 
-from pipecat.adapters.schemas.function_schema import FunctionSchema
-from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.evals.transport import EvalTransportParams
 from pipecat.frames.frames import LLMRunFrame
 from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.runner import PipelineRunner
-from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
@@ -31,22 +29,36 @@ from pipecat.services.llm_service import FunctionCallParams
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.daily.transport import DailyParams
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
+from pipecat.workers.runner import WorkerRunner
 
 load_dotenv(override=True)
 
 
-async def get_weather(params: FunctionCallParams):
-    location = params.arguments["location"]
+async def get_current_weather(params: FunctionCallParams, location: str):
+    """Get the current weather.
+
+    Args:
+        location: The city and state, e.g. "San Francisco, CA".
+    """
     await params.result_callback(f"The weather in {location} is currently 72 degrees and sunny.")
 
 
-async def fetch_restaurant_recommendation(params: FunctionCallParams):
+async def get_restaurant_recommendation(params: FunctionCallParams, location: str):
+    """Get a restaurant recommendation.
+
+    Args:
+        location: The city and state, e.g. "San Francisco, CA".
+    """
     await params.result_callback({"name": "The Golden Dragon"})
 
 
 # We use lambdas to defer transport parameter creation until the transport
 # type is selected at runtime.
 transport_params = {
+    "eval": lambda: EvalTransportParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+    ),
     "daily": lambda: DailyParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
@@ -80,34 +92,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             system_instruction="You are a helpful assistant in a voice conversation. Your responses will be spoken aloud, so avoid emojis, bullet points, or other formatting that can't be spoken. Respond to what the user said in a creative, helpful, and brief way.",
         ),
     )
-    llm.register_function("get_weather", get_weather)
-    llm.register_function("get_restaurant_recommendation", fetch_restaurant_recommendation)
-
-    weather_function = FunctionSchema(
-        name="get_weather",
-        description="Get the current weather",
-        properties={
-            "location": {
-                "type": "string",
-                "description": "The city and state, e.g. San Francisco, CA",
-            },
-        },
-        required=["location"],
-    )
-    restaurant_function = FunctionSchema(
-        name="get_restaurant_recommendation",
-        description="Get a restaurant recommendation",
-        properties={
-            "location": {
-                "type": "string",
-                "description": "The city and state, e.g. San Francisco, CA",
-            },
-        },
-        required=["location"],
-    )
-    tools = ToolsSchema(standard_tools=[weather_function, restaurant_function])
-
-    context = LLMContext(tools=tools)
+    context = LLMContext(tools=[get_current_weather, get_restaurant_recommendation])
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
@@ -125,7 +110,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         ]
     )
 
-    task = PipelineTask(
+    worker = PipelineWorker(
         pipeline,
         params=PipelineParams(
             enable_metrics=True,
@@ -141,16 +126,17 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         context.add_message(
             {"role": "developer", "content": "Please introduce yourself to the user."}
         )
-        await task.queue_frames([LLMRunFrame()])
+        await worker.queue_frames([LLMRunFrame()])
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
         logger.info(f"Client disconnected")
-        await task.cancel()
+        await worker.cancel()
 
-    runner = PipelineRunner(handle_sigint=runner_args.handle_sigint)
+    runner = WorkerRunner(handle_sigint=runner_args.handle_sigint)
 
-    await runner.run(task)
+    await runner.add_workers(worker)
+    await runner.run()
 
 
 async def bot(runner_args: RunnerArguments):

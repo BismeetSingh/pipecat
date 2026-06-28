@@ -23,6 +23,7 @@ from pipecat.services.openai.responses.llm import (
     OpenAIResponsesHttpLLMService,
     OpenAIResponsesLLMService,
 )
+from pipecat.services.openrouter.llm import OpenRouterLLMService
 
 
 @pytest.mark.asyncio
@@ -103,6 +104,35 @@ async def test_openai_run_inference_client_exception():
 
         with pytest.raises(Exception, match="API Error"):
             await service.run_inference(mock_context)
+
+
+@pytest.mark.asyncio
+async def test_openrouter_run_inference_converts_developer_messages_to_user():
+    """Test OpenRouter requests convert developer messages for broad model compatibility."""
+    with patch.object(OpenRouterLLMService, "create_client"):
+        service = OpenRouterLLMService(settings=OpenRouterLLMService.Settings(model="gpt-4"))
+        service._client = AsyncMock()
+
+        mock_context = MagicMock(spec=LLMContext)
+        mock_adapter = MagicMock()
+        mock_adapter.get_llm_invocation_params.return_value = OpenAILLMInvocationParams(
+            messages=[{"role": "user", "content": "Tool result"}],
+            tools=OPENAI_NOT_GIVEN,
+            tool_choice=OPENAI_NOT_GIVEN,
+        )
+        service.get_llm_adapter = MagicMock(return_value=mock_adapter)
+
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "Done"
+        service._client.chat.completions.create.return_value = mock_response
+
+        result = await service.run_inference(mock_context)
+
+        assert result == "Done"
+        mock_adapter.get_llm_invocation_params.assert_called_once_with(
+            mock_context, system_instruction=None, convert_developer_to_user=True
+        )
 
 
 @pytest.mark.asyncio
@@ -279,12 +309,12 @@ async def test_aws_bedrock_run_inference_with_llm_context():
     }
     mock_client.converse.return_value = mock_response
 
-    # Patch the _aws_session.client method to be an async context manager
+    # Patch the _aws_session.create_client method to be an async context manager
     mock_context_manager = AsyncMock()
     mock_context_manager.__aenter__ = AsyncMock(return_value=mock_client)
     mock_context_manager.__aexit__ = AsyncMock(return_value=None)
 
-    with patch.object(service._aws_session, "client", return_value=mock_context_manager):
+    with patch.object(service._aws_session, "create_client", return_value=mock_context_manager):
         # Execute
         result = await service.run_inference(mock_context)
 
@@ -325,12 +355,12 @@ async def test_aws_bedrock_run_inference_client_exception():
     mock_client = AsyncMock()
     mock_client.converse.side_effect = Exception("Bedrock API Error")
 
-    # Patch the _aws_session.client method to be an async context manager
+    # Patch the _aws_session.create_client method to be an async context manager
     mock_context_manager = AsyncMock()
     mock_context_manager.__aenter__ = AsyncMock(return_value=mock_client)
     mock_context_manager.__aexit__ = AsyncMock(return_value=None)
 
-    with patch.object(service._aws_session, "client", return_value=mock_context_manager):
+    with patch.object(service._aws_session, "create_client", return_value=mock_context_manager):
         with pytest.raises(Exception, match="Bedrock API Error"):
             await service.run_inference(mock_context)
 
@@ -560,7 +590,7 @@ async def test_aws_bedrock_run_inference_system_instruction_overrides_context():
     mock_context_manager.__aenter__ = AsyncMock(return_value=mock_client)
     mock_context_manager.__aexit__ = AsyncMock(return_value=None)
 
-    with patch.object(service._aws_session, "client", return_value=mock_context_manager):
+    with patch.object(service._aws_session, "create_client", return_value=mock_context_manager):
         result = await service.run_inference(
             mock_context, system_instruction="New system instruction"
         )
@@ -598,7 +628,7 @@ async def test_aws_bedrock_run_inference_system_instruction_none_unchanged():
     mock_context_manager.__aenter__ = AsyncMock(return_value=mock_client)
     mock_context_manager.__aexit__ = AsyncMock(return_value=None)
 
-    with patch.object(service._aws_session, "client", return_value=mock_context_manager):
+    with patch.object(service._aws_session, "create_client", return_value=mock_context_manager):
         result = await service.run_inference(mock_context)
 
         assert result == "Response"

@@ -13,10 +13,11 @@ from dotenv import load_dotenv
 from loguru import logger
 
 from pipecat.audio.filters.aic_filter import AICFilter
+from pipecat.audio.vad.aic_quail_vad import AICQuailVADAnalyzer
+from pipecat.evals.transport import EvalTransportParams
 from pipecat.frames.frames import LLMRunFrame
 from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.runner import PipelineRunner
-from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
@@ -31,28 +32,34 @@ from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.daily.transport import DailyParams
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
+from pipecat.workers.runner import WorkerRunner
 
 load_dotenv(override=True)
 
 
 def _create_aic_filter() -> AICFilter:
-    license_key = os.getenv("AIC_LICENSE_KEY", "")
+    license_key = os.environ["AIC_SDK_LICENSE"]
 
     return AICFilter(
         license_key=license_key,
-        model_id="quail-vf-2.1-l-16khz",
+        model_id="quail-vf-2.2-l-16khz",
         enhancement_level=0.8,
     )
 
 
 aic_filter = _create_aic_filter()
-aic_vad_analyzer = aic_filter.create_vad_analyzer(
-    speech_hold_duration=0.05, minimum_speech_duration=0.0, sensitivity=6.0
+aic_vad_analyzer = AICQuailVADAnalyzer(
+    license_key=os.environ["AIC_SDK_LICENSE"],
 )
 
 # We use lambdas to defer transport parameter creation until the transport
 # type is selected at runtime.
 transport_params = {
+    "eval": lambda: EvalTransportParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+        audio_in_filter=aic_filter,
+    ),
     "daily": lambda: DailyParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
@@ -115,7 +122,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         ]
     )
 
-    task = PipelineTask(
+    worker = PipelineWorker(
         pipeline,
         params=PipelineParams(
             enable_metrics=True,
@@ -132,7 +139,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         context.add_message(
             {"role": "developer", "content": "Please introduce yourself to the user."}
         )
-        await task.queue_frames([LLMRunFrame()])
+        await worker.queue_frames([LLMRunFrame()])
 
     @audiobuffer.event_handler("on_audio_data")
     async def on_audio_data(buffer, audio, sample_rate, num_channels):
@@ -152,11 +159,12 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
         logger.info(f"Client disconnected")
-        await task.cancel()
+        await worker.cancel()
 
-    runner = PipelineRunner(handle_sigint=runner_args.handle_sigint)
+    runner = WorkerRunner(handle_sigint=runner_args.handle_sigint)
 
-    await runner.run(task)
+    await runner.add_workers(worker)
+    await runner.run()
 
 
 async def bot(runner_args: RunnerArguments):

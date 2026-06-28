@@ -4,9 +4,9 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
-"""RTVI protocol v1 message models.
+"""RTVI protocol v2 message models.
 
-Contains all RTVI protocol v1 message definitions and data structures.
+Contains all RTVI protocol v2 message definitions and data structures.
 Import this module under the ``RTVI`` alias to use as a namespace::
 
     import pipecat.processors.frameworks.rtvi.models as RTVI
@@ -22,12 +22,18 @@ from typing import (
 
 from pydantic import BaseModel, ConfigDict
 
+from pipecat.audio.dtmf.types import KeypadEntry
 from pipecat.frames.frames import (
     AggregationType,
 )
+from pipecat.utils.deprecation import deprecated
 
 # -- Constants --
-PROTOCOL_VERSION = "1.3.0"
+PROTOCOL_VERSION = "2.0.0"
+
+# -- Version compatibility --
+# Any 1.x client is deprecated but still supported with the old bot-output format.
+LEGACY_SUPPORTED_MAJOR = 1
 
 MESSAGE_LABEL = "rtvi-ai"
 MessageLiteral = Literal["rtvi-ai"]
@@ -178,13 +184,17 @@ class BotReady(BaseModel):
     data: BotReadyData
 
 
+@deprecated(
+    "`LLMFunctionCallMessageData` is deprecated since 0.0.102 and will be removed in 2.0.0. "
+    "Use `LLMFunctionCallInProgressMessageData` instead."
+)
 class LLMFunctionCallMessageData(BaseModel):
     """Data for LLM function call notification.
 
     Contains function call details including name, ID, and arguments.
 
     .. deprecated:: 0.0.102
-        Use ``LLMFunctionCallInProgressMessageData`` instead.
+        Use :class:`LLMFunctionCallInProgressMessageData` instead. Will be removed in 2.0.0.
     """
 
     function_name: str
@@ -192,14 +202,18 @@ class LLMFunctionCallMessageData(BaseModel):
     args: Mapping[str, Any]
 
 
+@deprecated(
+    "`LLMFunctionCallMessage` is deprecated since 0.0.102 and will be removed in 2.0.0. "
+    "Use `LLMFunctionCallInProgressMessage` instead."
+)
 class LLMFunctionCallMessage(BaseModel):
     """Message notifying of an LLM function call.
 
     Sent when the LLM makes a function call.
 
     .. deprecated:: 0.0.102
-        Use ``LLMFunctionCallInProgressMessage`` with the
-        ``llm-function-call-in-progress`` event type instead.
+        Use :class:`LLMFunctionCallInProgressMessage` with the
+        ``llm-function-call-in-progress`` event type instead. Will be removed in 2.0.0.
     """
 
     label: MessageLiteral = MESSAGE_LABEL
@@ -225,6 +239,17 @@ class SendTextData(BaseModel):
 
     content: str
     options: SendTextOptions | None = None
+
+
+class DTMFInputData(BaseModel):
+    """Data format for a DTMF keypress sent from the client.
+
+    Carries a single keypad entry. Clients send one ``dtmf`` message per key, the
+    way a telephony transport delivers them; the bot's DTMF handling (e.g. a
+    ``DTMFAggregator``) sequences them.
+    """
+
+    button: KeypadEntry
 
 
 class LLMFunctionCallStartMessageData(BaseModel):
@@ -345,15 +370,68 @@ class TextMessageData(BaseModel):
     text: str
 
 
+SpokenStatus = Literal["new", "in-progress", "completed"] | None
+
+
+class SpokenProgressData(BaseModel):
+    """Word-level TTS progress within a spoken segment.
+
+    Parameters:
+        accumulated_text: Text already spoken in this segment, including the current word.
+        remaining_text: Text not yet spoken in this segment.
+    """
+
+    accumulated_text: str
+    remaining_text: str
+
+
+class BotOutputTransformResult(BaseModel):
+    """Return type for bot output transform functions.
+
+    Parameters:
+        text: The transformed full text of the segment.
+        accumulated_text: Transformed spoken-so-far portion. Only populated
+            when the transform is called from a progress context.
+        remaining_text: Transformed not-yet-spoken portion. Only populated
+            when the transform is called from a progress context.
+    """
+
+    text: str
+    accumulated_text: str | None = None
+    remaining_text: str | None = None
+
+
 class BotOutputMessageData(TextMessageData):
     """Data for bot output RTVI messages.
 
     Extends TextMessageData to include metadata about the output.
+
+    This class supports both protocol v1 (1.4.x) and v2 (2.0.0+) clients. The
+    observer populates different field subsets depending on the negotiated version;
+    ``send_rtvi_message`` serialises with ``exclude_none=True`` so each client
+    only sees the fields relevant to its version.
+
+    Parameters:
+        aggregated_by: What form the text is in (e.g., sentence, code, etc.).
+        segment_id: ID of the source AggregatedTextFrame.
+        spoken: **(v1 only)** Whether the text has been spoken by TTS.
+        will_be_spoken: **(v2+)** Whether the text will be spoken by TTS.
+        spoken_status: **(v2+)** Lifecycle status of the segment:
+            ``"new"`` on first emit, ``"in-progress"`` during word playback,
+            ``"completed"`` when the last word is spoken (or immediately for
+            non-spoken segments).
+        spoken_progress: **(v2+)** Accumulated / remaining text breakdown.
+            Present when ``will_be_spoken`` is ``True``.
     """
 
-    spoken: bool = False  # Indicates if the text has been spoken by TTS
     aggregated_by: AggregationType | str
-    # Indicates what form the text is in (e.g., by word, sentence, etc.)
+    segment_id: int | None = None
+    # v1 field (protocol 1.4.x)
+    spoken: bool | None = None
+    # v2 fields (protocol 2.0.0+)
+    will_be_spoken: bool | None = None
+    spoken_status: SpokenStatus | None = None
+    spoken_progress: SpokenProgressData | None = None
 
 
 class BotOutputMessage(BaseModel):
@@ -471,6 +549,28 @@ class UserStoppedSpeakingMessage(BaseModel):
     type: Literal["user-stopped-speaking"] = "user-stopped-speaking"
 
 
+class VADUserStartedSpeakingMessage(BaseModel):
+    """Message indicating VAD detected the user started speaking.
+
+    Raw VAD signal, emitted independently of turn finalization (unlike
+    ``user-started-speaking``, which a turn strategy may gate or defer).
+    """
+
+    label: MessageLiteral = MESSAGE_LABEL
+    type: Literal["vad-user-started-speaking"] = "vad-user-started-speaking"
+
+
+class VADUserStoppedSpeakingMessage(BaseModel):
+    """Message indicating VAD detected the user stopped speaking.
+
+    Raw VAD signal, emitted independently of turn finalization (unlike
+    ``user-stopped-speaking``, which a turn strategy may gate or defer).
+    """
+
+    label: MessageLiteral = MESSAGE_LABEL
+    type: Literal["vad-user-stopped-speaking"] = "vad-user-stopped-speaking"
+
+
 class UserMuteStartedMessage(BaseModel):
     """Message indicating user has been muted."""
 
@@ -497,6 +597,18 @@ class BotStoppedSpeakingMessage(BaseModel):
 
     label: MessageLiteral = MESSAGE_LABEL
     type: Literal["bot-stopped-speaking"] = "bot-stopped-speaking"
+
+
+class BotInterruptedMessage(BaseModel):
+    """Message indicating the bot was interrupted and its in-flight output cut off.
+
+    Fires for any pipeline interruption — a VAD-detected user barge-in or a
+    programmatic interrupt (e.g. ``send-text`` with ``run_immediately``) — so a
+    client can drop whatever the bot was mid-saying.
+    """
+
+    label: MessageLiteral = MESSAGE_LABEL
+    type: Literal["bot-interrupted"] = "bot-interrupted"
 
 
 class MetricsMessage(BaseModel):
@@ -551,40 +663,39 @@ class SystemLogMessage(BaseModel):
     data: TextMessageData
 
 
-# -- UI Agent Protocol -------------------------------------------------------
+# -- UI Worker Protocol ------------------------------------------------------
 #
-# A structured RTVI message vocabulary that lets server-side AI agents
+# A structured RTVI message vocabulary that lets server-side workers
 # observe and drive a GUI app on the client side. The protocol covers
 # five first-class RTVI message types:
 #
 #   ui-event         client-to-server event message
 #   ui-command       server-to-client command message
 #   ui-snapshot      client-to-server accessibility snapshot
-#   ui-cancel-task   client-to-server cancellation request
-#   ui-task          server-to-client task lifecycle envelope
+#   ui-cancel-job-group   client-to-server cancellation request
+#   ui-job-group          server-to-client job-group lifecycle envelope
 #
 # This section is data only (constants and payload models, no
-# behavior). Higher-level frameworks like ``pipecat-ai-subagents``
-# build the agent abstractions on top, and single-LLM Pipecat apps can
-# target the same wire format directly via custom tools that emit
-# typed RTVI messages with these types. The matching client-side
-# implementation lives in ``@pipecat-ai/client-js`` and
-# ``@pipecat-ai/client-react``.
+# behavior). ``pipecat.workers.ui.UIWorker`` builds the higher-level
+# abstractions on top, and single-LLM Pipecat apps can target the same
+# wire format directly via custom tools that emit typed RTVI messages
+# with these types. The matching client-side implementation lives in
+# ``@pipecat-ai/client-js`` and ``@pipecat-ai/client-react``.
 
 # The wire-format ``type`` strings (``"ui-event"``, ``"ui-command"``,
-# ``"ui-snapshot"``, ``"ui-cancel-task"``, ``"ui-task"``) are pinned
+# ``"ui-snapshot"``, ``"ui-cancel-job-group"``, ``"ui-job-group"``) are pinned
 # as ``Literal[...]`` field defaults on the corresponding ``*Message``
 # pydantic class below, matching the convention used for every other
 # RTVI message type in this module.
 
-# Each ``ui-task`` envelope carries a ``kind`` field that the client's
-# task reducer dispatches on. The four kinds form the lifecycle of a
-# user-facing task group:
+# Each ``ui-job-group`` envelope carries a ``kind`` field that the client's
+# reducer dispatches on. The four kinds form the lifecycle of a
+# user-facing job group:
 #
-#   group_started → task_update* → task_completed × N → group_completed
+#   group_started → job_update* → job_completed × N → group_completed
 #
 # where N is the number of workers in the group. The kind strings are
-# pinned as ``Literal[...]`` defaults on the matching ``UITask*Data``
+# pinned as ``Literal[...]`` defaults on the matching ``UIJob*Data``
 # class below.
 
 
@@ -704,94 +815,94 @@ class UISnapshotData(BaseModel):
     tree: A11ySnapshot
 
 
-class UICancelTaskData(BaseModel):
-    """Inner ``data`` for a ``ui-cancel-task`` message.
+class UICancelJobGroupData(BaseModel):
+    """Inner ``data`` for a ``ui-cancel-job-group`` message.
 
     Parameters:
-        task_id: The task group id the client wants cancelled.
+        job_id: The job group id the client wants cancelled.
         reason: Optional human-readable reason.
     """
 
-    task_id: str
+    job_id: str
     reason: str | None = None
 
 
-class UITaskGroupStartedData(BaseModel):
-    """``data`` for a ``ui-task`` envelope with kind ``group_started``.
+class UIJobGroupStartedData(BaseModel):
+    """``data`` for a ``ui-job-group`` envelope with kind ``group_started``.
 
     Parameters:
         kind: Always ``"group_started"``.
-        task_id: Shared task identifier for the group.
-        agents: Names of the agents the work was dispatched to.
+        job_id: Shared job-group identifier for the group.
+        workers: Names of the workers the work was dispatched to.
         label: Optional human-readable label for the group.
         cancellable: Whether the client may request cancellation.
         at: Epoch milliseconds when the group started.
     """
 
     kind: Literal["group_started"] = "group_started"
-    task_id: str
-    agents: list[str] | None = None
+    job_id: str
+    workers: list[str] | None = None
     label: str | None = None
     cancellable: bool = True
     at: int = 0
 
 
-class UITaskUpdateData(BaseModel):
-    """``data`` for a ``ui-task`` envelope with kind ``task_update``.
+class UIJobUpdateData(BaseModel):
+    """``data`` for a ``ui-job-group`` envelope with kind ``job_update``.
 
     Parameters:
-        kind: Always ``"task_update"``.
-        task_id: The shared task identifier.
-        agent_name: The worker that produced the update.
+        kind: Always ``"job_update"``.
+        job_id: The shared job-group identifier.
+        worker_name: The worker that produced the update.
         data: The worker's update payload, forwarded verbatim.
         at: Epoch milliseconds when the update was emitted.
     """
 
-    kind: Literal["task_update"] = "task_update"
-    task_id: str
-    agent_name: str
+    kind: Literal["job_update"] = "job_update"
+    job_id: str
+    worker_name: str
     data: Any | None = None
     at: int = 0
 
 
-class UITaskCompletedData(BaseModel):
-    """``data`` for a ``ui-task`` envelope with kind ``task_completed``.
+class UIJobCompletedData(BaseModel):
+    """``data`` for a ``ui-job-group`` envelope with kind ``job_completed``.
 
     Parameters:
-        kind: Always ``"task_completed"``.
-        task_id: The shared task identifier.
-        agent_name: The worker that produced the response.
+        kind: Always ``"job_completed"``.
+        job_id: The shared job-group identifier.
+        worker_name: The worker that produced the response.
         status: Completion status string.
         response: The worker's response payload.
         at: Epoch milliseconds when the response was received.
     """
 
-    kind: Literal["task_completed"] = "task_completed"
-    task_id: str
-    agent_name: str
+    kind: Literal["job_completed"] = "job_completed"
+    job_id: str
+    worker_name: str
     status: str
     response: Any | None = None
     at: int = 0
 
 
-class UITaskGroupCompletedData(BaseModel):
-    """``data`` for a ``ui-task`` envelope with kind ``group_completed``.
+class UIJobGroupCompletedData(BaseModel):
+    """``data`` for a ``ui-job-group`` envelope with kind ``group_completed``.
 
     Parameters:
         kind: Always ``"group_completed"``.
-        task_id: The shared task identifier.
+        job_id: The shared job-group identifier.
         at: Epoch milliseconds when the group completed.
     """
 
     kind: Literal["group_completed"] = "group_completed"
-    task_id: str
+    job_id: str
     at: int = 0
 
 
-#: Discriminated union over the four task-lifecycle data shapes,
+#: Discriminated union over the four job-group lifecycle data shapes,
 #: keyed by the ``kind`` field.
-UITaskData = (
-    UITaskGroupStartedData | UITaskUpdateData | UITaskCompletedData | UITaskGroupCompletedData
+UIJobGroupData = (
+    UIJobGroupStartedData | UIJobUpdateData | UIJobCompletedData | UIJobGroupCompletedData
 )
 
 
@@ -824,25 +935,25 @@ class UISnapshotMessage(BaseModel):
     data: UISnapshotData
 
 
-class UICancelTaskMessage(BaseModel):
-    """RTVI ``ui-cancel-task`` message (client → server)."""
+class UICancelJobGroupMessage(BaseModel):
+    """RTVI ``ui-cancel-job-group`` message (client → server)."""
 
     label: MessageLiteral = MESSAGE_LABEL
-    type: Literal["ui-cancel-task"] = "ui-cancel-task"
+    type: Literal["ui-cancel-job-group"] = "ui-cancel-job-group"
     id: str
-    data: UICancelTaskData
+    data: UICancelJobGroupData
 
 
-class UITaskMessage(BaseModel):
-    """RTVI ``ui-task`` message (server → client).
+class UIJobGroupMessage(BaseModel):
+    """RTVI ``ui-job-group`` message (server → client).
 
-    The ``data`` field is one of the four task-lifecycle
+    The ``data`` field is one of the four job-group lifecycle
     discriminated by the ``kind`` field.
     """
 
     label: MessageLiteral = MESSAGE_LABEL
-    type: Literal["ui-task"] = "ui-task"
-    data: UITaskData
+    type: Literal["ui-job-group"] = "ui-job-group"
+    data: UIJobGroupData
 
 
 # -- UI command payloads --
@@ -943,7 +1054,7 @@ class Click(BaseModel):
     Closes the form-fill loop for non-text inputs (checkboxes, radios)
     and exposes the rest of the action vocabulary (submit buttons,
     links, app-specific clickable nodes). The standard handler
-    silently no-ops on ``disabled`` targets so the agent can't bypass
+    silently no-ops on ``disabled`` targets so the worker can't bypass
     UI affordances the user is meant to control.
 
     For native ``<select>``, prefer ``SetInputValue`` (clicking
@@ -964,14 +1075,14 @@ class Click(BaseModel):
 class SetInputValue(BaseModel):
     """Write a value into a text input or textarea on the client.
 
-    Use this for form-filling: the agent has decided what should go
+    Use this for form-filling: the worker has decided what should go
     into a field (clarifying answer, tax form entry, etc.) and asks
     the client to populate it. With ``replace=True`` (the default),
     the existing value is overwritten; with ``replace=False`` the
     value is appended.
 
     The standard handler silently no-ops on ``disabled``, ``readonly``,
-    and ``<input type="hidden">`` targets so the agent can't write
+    and ``<input type="hidden">`` targets so the worker can't write
     into fields the user can't.
 
     Parameters:
@@ -991,11 +1102,11 @@ class SetInputValue(BaseModel):
 
 
 class SelectText(BaseModel):
-    """Select text on the page so the user can see what the agent means.
+    """Select text on the page so the user can see what the worker means.
 
     Mirror of the ``selection`` field surfaced in the snapshot. Use
     this to point the user's attention at a specific paragraph or
-    range after the agent has decided what it's referring to.
+    range after the worker has decided what it's referring to.
 
     With ``start_offset`` and ``end_offset`` omitted, the entire
     target's text content is selected (``Range.selectNodeContents``

@@ -5,7 +5,8 @@
 #
 
 import unittest
-from unittest.mock import AsyncMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
 
 from pipecat.adapters.base_llm_adapter import BaseLLMAdapter
 from pipecat.adapters.schemas.function_schema import FunctionSchema
@@ -16,8 +17,11 @@ from pipecat.frames.frames import (
     FunctionCallInProgressFrame,
     FunctionCallResultFrame,
     FunctionCallsStartedFrame,
+    LLMContextFrame,
+    LLMSetToolsFrame,
 )
-from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_context import NOT_GIVEN, LLMContext
+from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.llm_service import LLMService
 from pipecat.services.settings import LLMSettings
 from pipecat.turns.user_mute.function_call_user_mute_strategy import FunctionCallUserMuteStrategy
@@ -33,7 +37,7 @@ class MockLLMService(LLMService):
     def __init__(self, **kwargs):
         settings = LLMSettings(
             model="test-model",
-            system_instruction=None,
+            system_instruction=kwargs.pop("system_instruction", None),
             temperature=None,
             max_tokens=None,
             top_p=None,
@@ -45,6 +49,8 @@ class MockLLMService(LLMService):
             user_turn_completion_config=None,
         )
         super().__init__(settings=settings, **kwargs)
+        # Stub the pipeline task so FunctionCallParams can be constructed.
+        self._pipeline_worker = SimpleNamespace(app_resources=None)
 
 
 class TestUnparameterizedSubclass(unittest.TestCase):
@@ -314,3 +320,97 @@ class TestLLMService(unittest.IsolatedAsyncioTestCase):
             muted = await strategy.process_frame(frame)
 
         self.assertFalse(muted)
+
+
+class TestAppendSystemInstruction(unittest.IsolatedAsyncioTestCase):
+    """Coverage for `LLMService.append_system_instruction`."""
+
+    def _service(self, system_instruction: str | None = None) -> MockLLMService:
+        # Construct with the prompt so the base snapshot happens the real way
+        # (in __init__), rather than poking _base_system_instruction directly.
+        return MockLLMService(system_instruction=system_instruction)
+
+    def test_append_preserves_existing_prompt(self):
+        service = self._service("APP")
+        service.append_system_instruction("GUIDE")
+        self.assertEqual(service._settings.system_instruction, "APP\n\nGUIDE")
+
+    def test_append_with_no_base_uses_text_alone(self):
+        service = self._service(None)
+        service.append_system_instruction("GUIDE")
+        self.assertEqual(service._settings.system_instruction, "GUIDE")
+
+    def test_multiple_appends_join_in_order(self):
+        service = self._service("APP")
+        service.append_system_instruction("G1")
+        service.append_system_instruction("G2")
+        self.assertEqual(service._settings.system_instruction, "APP\n\nG1\n\nG2")
+
+    async def test_appended_guide_survives_turn_completion_toggle(self):
+        service = self._service("APP")
+        service.append_system_instruction("GUIDE")
+
+        # Enabling turn completion composes after the appended guide, once.
+        await service._update_settings(LLMSettings(filter_incomplete_user_turns=True))
+        composed = service._settings.system_instruction
+        self.assertTrue(composed.startswith("APP\n\nGUIDE\n\n"))
+        self.assertEqual(composed.count("GUIDE"), 1)
+
+        # Disabling restores base + guide (without the turn instructions).
+        await service._update_settings(LLMSettings(filter_incomplete_user_turns=False))
+        self.assertEqual(service._settings.system_instruction, "APP\n\nGUIDE")
+
+    async def test_runtime_system_instruction_update_preserves_appended(self):
+        service = self._service("APP")
+        service.append_system_instruction("GUIDE")
+
+        # A runtime system_instruction change replaces the base but keeps the
+        # appended guide composed onto the end.
+        await service._update_settings(LLMSettings(system_instruction="NEW"))
+        self.assertEqual(service._settings.system_instruction, "NEW\n\nGUIDE")
+
+    async def test_base_set_after_append_composes(self):
+        # No base at construction; the guide is appended first, then the user
+        # sets a system_instruction at runtime. The guide is retained.
+        service = self._service(None)
+        service.append_system_instruction("GUIDE")
+        self.assertEqual(service._settings.system_instruction, "GUIDE")
+
+        await service._update_settings(LLMSettings(system_instruction="APP"))
+        self.assertEqual(service._settings.system_instruction, "APP\n\nGUIDE")
+
+    async def test_appended_guide_survives_async_tool_cancellation_toggle(self):
+        service = self._service("APP")
+        service.append_system_instruction("GUIDE")
+
+        # Enabling async tool cancellation composes after the appended guide,
+        # without duplicating it.
+        service._setup_async_tool_cancellation()
+        composed = service._settings.system_instruction
+        self.assertTrue(composed.startswith("APP\n\nGUIDE\n\n"))
+        self.assertEqual(composed.count("GUIDE"), 1)
+        self.assertNotEqual(composed, "APP\n\nGUIDE")  # async instructions appended
+
+        # Disabling recomposes back to base + guide.
+        service._teardown_async_tool_cancellation()
+        self.assertEqual(service._settings.system_instruction, "APP\n\nGUIDE")
+
+
+class TestProcessFrameToolWiring(unittest.IsolatedAsyncioTestCase):
+    """process_frame syncs handlers from the context frame's advertised tools."""
+
+    async def test_context_frame_syncs_registered_direct_functions(self):
+        service = MockLLMService()
+        service._sync_registered_tool_handlers = Mock()
+        ctx = LLMContext(tools=NOT_GIVEN)
+        await service.process_frame(LLMContextFrame(context=ctx), FrameDirection.DOWNSTREAM)
+        service._sync_registered_tool_handlers.assert_called_once_with(ctx.tools)
+
+    async def test_base_service_does_not_handle_set_tools_frame(self):
+        # The base service syncs handlers only from the context frame. An
+        # LLMSetToolsFrame is a pure aggregator concern here; only realtime
+        # services that run continuously handle it for handler sync.
+        service = MockLLMService()
+        service._sync_registered_tool_handlers = Mock()
+        await service.process_frame(LLMSetToolsFrame(tools=NOT_GIVEN), FrameDirection.DOWNSTREAM)
+        service._sync_registered_tool_handlers.assert_not_called()

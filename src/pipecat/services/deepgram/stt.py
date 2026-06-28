@@ -7,6 +7,7 @@
 """Deepgram speech-to-text service implementation."""
 
 import asyncio
+import inspect
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field, fields
 from typing import Any
@@ -33,6 +34,7 @@ from pipecat.services.settings import (
 from pipecat.services.stt_latency import DEEPGRAM_TTFS_P99
 from pipecat.services.stt_service import STTService
 from pipecat.transcriptions.language import Language
+from pipecat.utils.deprecation import deprecated
 from pipecat.utils.time import time_now_iso8601
 from pipecat.utils.tracing.service_decorators import traced_stt
 
@@ -47,10 +49,14 @@ try:
     )
 except ModuleNotFoundError as e:
     logger.error(f"Exception: {e}")
-    logger.error("In order to use Deepgram, you need to `pip install pipecat-ai[deepgram]`.")
-    raise Exception(f"Missing module: {e}")
+    logger.error('In order to use Deepgram, you need to `uv add "pipecat-ai[deepgram]"`.')
+    raise ImportError(f"Missing module: {e}") from e
 
 
+@deprecated(
+    "`LiveOptions` is deprecated since 0.0.105 and will be removed in 2.0.0. Use "
+    "`DeepgramSTTService.Settings` instead."
+)
 class LiveOptions:
     """Deepgram live transcription options.
 
@@ -60,6 +66,7 @@ class LiveOptions:
     .. deprecated:: 0.0.105
         Use ``settings=DeepgramSTTService.Settings(...)`` for runtime-updatable fields
         and direct ``__init__`` parameters for connection-level config instead.
+        Will be removed in 2.0.0.
     """
 
     def __init__(
@@ -330,6 +337,7 @@ class DeepgramSTTService(STTService):
                 .. deprecated:: 0.0.105
                     Use ``settings=DeepgramSTTService.Settings(...)`` for runtime-updatable
                     fields and direct init parameters for connection-level config.
+                    Will be removed in 2.0.0.
 
             addons: Additional Deepgram features to enable.
             settings: Runtime-updatable settings. When provided alongside
@@ -428,11 +436,16 @@ class DeepgramSTTService(STTService):
                 from deepgram import DeepgramClientEnvironment
 
                 ws_url, http_url = _derive_deepgram_urls(base_url)
-                environment = DeepgramClientEnvironment(
-                    base=http_url,
-                    production=ws_url,
-                    agent=ws_url,
-                )
+                env_kwargs: dict[str, str] = {
+                    "base": http_url,
+                    "production": ws_url,
+                    "agent": ws_url,
+                }
+                # deepgram-sdk 7.2.0 added a required `agent_rest` kwarg; older
+                # 6.x releases do not accept it. Pass it only when present.
+                if "agent_rest" in inspect.signature(DeepgramClientEnvironment).parameters:
+                    env_kwargs["agent_rest"] = http_url
+                environment = DeepgramClientEnvironment(**env_kwargs)
                 self._client = AsyncDeepgramClient(api_key=api_key, environment=environment)
             except Exception:
                 logger.warning(

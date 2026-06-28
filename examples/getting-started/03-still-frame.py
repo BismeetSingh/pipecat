@@ -9,15 +9,16 @@ import os
 from dotenv import load_dotenv
 from loguru import logger
 
+from pipecat.evals.transport import EvalTransportParams
 from pipecat.frames.frames import TextFrame
 from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.runner import PipelineRunner
-from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
 from pipecat.services.google.image import GoogleImageGenService
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.daily.transport import DailyParams
+from pipecat.workers.runner import WorkerRunner
 
 load_dotenv(override=True)
 
@@ -25,6 +26,10 @@ load_dotenv(override=True)
 # We use lambdas to defer transport parameter creation until the transport
 # type is selected at runtime.
 transport_params = {
+    "eval": lambda: EvalTransportParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+    ),
     "daily": lambda: DailyParams(
         video_out_enabled=True,
         video_out_width=1024,
@@ -45,7 +50,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         api_key=os.environ["GOOGLE_API_KEY"],
     )
 
-    task = PipelineTask(
+    worker = PipelineWorker(
         Pipeline([imagegen, transport.output()]),
         params=PipelineParams(
             enable_metrics=True,
@@ -57,18 +62,19 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     # Register an event handler so we can play the audio when the client joins
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
-        await task.queue_frame(TextFrame("a cat in the style of picasso"))
-        await task.queue_frame(TextFrame("a dog in the style of picasso"))
-        await task.queue_frame(TextFrame("a fish in the style of picasso"))
+        await worker.queue_frame(TextFrame("a cat in the style of picasso"))
+        await worker.queue_frame(TextFrame("a dog in the style of picasso"))
+        await worker.queue_frame(TextFrame("a fish in the style of picasso"))
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
         logger.info(f"Client disconnected")
-        await task.cancel()
+        await worker.cancel()
 
-    runner = PipelineRunner(handle_sigint=runner_args.handle_sigint)
+    runner = WorkerRunner(handle_sigint=runner_args.handle_sigint)
 
-    await runner.run(task)
+    await runner.add_workers(worker)
+    await runner.run()
 
 
 async def bot(runner_args: RunnerArguments):

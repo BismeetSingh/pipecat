@@ -23,8 +23,11 @@ from typing import (
 )
 
 import aiohttp
+import websockets
 from loguru import logger
 from pydantic import BaseModel
+from websockets.asyncio.client import connect as websocket_connect
+from websockets.protocol import State
 
 from pipecat.frames.frames import (
     CancelFrame,
@@ -46,17 +49,8 @@ from pipecat.services.tts_service import (
     WebsocketTTSService,
 )
 from pipecat.transcriptions.language import Language, resolve_language
+from pipecat.utils.deprecation import deprecated
 from pipecat.utils.tracing.service_decorators import traced_tts
-
-# See .env.example for ElevenLabs configuration needed
-try:
-    import websockets
-    from websockets.asyncio.client import connect as websocket_connect
-    from websockets.protocol import State
-except ModuleNotFoundError as e:
-    logger.error(f"Exception: {e}")
-    logger.error("In order to use ElevenLabs, you need to `pip install pipecat-ai[elevenlabs]`.")
-    raise Exception(f"Missing module: {e}")
 
 # Models that support language codes
 # The following models are excluded as they don't support language codes:
@@ -147,6 +141,17 @@ def output_format_from_sample_rate(sample_rate: int) -> str:
         f"ElevenLabsTTSService: No output format available for {sample_rate} sample rate"
     )
     return "pcm_24000"
+
+
+def _is_chinese_or_japanese_language(language: str) -> bool:
+    """Check if the given language is Chinese or Japanese."""
+    base_lang = language.split("-")[0].lower()
+    return base_lang in {"zh", "ja"}
+
+
+def _word_timestamps_include_inter_frame_spaces(language: str | None) -> bool:
+    """Whether timestamp text should be treated as carrying its own spacing."""
+    return bool(language and _is_chinese_or_japanese_language(language))
 
 
 def build_elevenlabs_voice_settings(
@@ -392,11 +397,16 @@ class ElevenLabsTTSService(WebsocketTTSService):
     Settings = ElevenLabsTTSSettings
     _settings: Settings
 
+    @deprecated(
+        "`ElevenLabsTTSService.InputParams` is deprecated since 0.0.105 and will be removed in "
+        "2.0.0. Use `ElevenLabsTTSService.Settings` instead."
+    )
     class InputParams(BaseModel):
         """Input parameters for ElevenLabs TTS configuration.
 
         .. deprecated:: 0.0.105
             Use ``settings=ElevenLabsTTSService.Settings(...)`` instead.
+            Will be removed in 2.0.0.
 
         Parameters:
             language: Language to use for synthesis.
@@ -450,11 +460,13 @@ class ElevenLabsTTSService(WebsocketTTSService):
 
                 .. deprecated:: 0.0.105
                     Use ``settings=ElevenLabsTTSService.Settings(voice=...)`` instead.
+                    Will be removed in 2.0.0.
 
             model: TTS model to use (e.g., "eleven_turbo_v2_5").
 
                 .. deprecated:: 0.0.105
                     Use ``settings=ElevenLabsTTSService.Settings(model=...)`` instead.
+                    Will be removed in 2.0.0.
 
             url: WebSocket URL for ElevenLabs TTS API.
             sample_rate: Audio sample rate. If None, uses default.
@@ -473,6 +485,7 @@ class ElevenLabsTTSService(WebsocketTTSService):
 
                 .. deprecated:: 0.0.105
                     Use ``settings=ElevenLabsTTSService.Settings(...)`` instead.
+                    Will be removed in 2.0.0.
 
             settings: Runtime-updatable settings. When provided alongside deprecated
                 parameters, ``settings`` values take precedence.
@@ -481,6 +494,7 @@ class ElevenLabsTTSService(WebsocketTTSService):
 
                 .. deprecated:: 0.0.104
                     Use ``text_aggregation_mode`` instead.
+                    Will be removed in 2.0.0.
 
             **kwargs: Additional arguments passed to the parent service.
         """
@@ -593,6 +607,10 @@ class ElevenLabsTTSService(WebsocketTTSService):
         self._partial_word = ""
         self._partial_word_start_time = 0.0
         self._alignment_started_context_ids: set[str | None] = set()
+
+        # Context IDs whose context-init has been sent, so the keepalive knows
+        # which contexts are safe to target.
+        self._context_init_sent: set[str] = set()
 
         # Context management for v1 multi API
         self._receive_task = None
@@ -792,6 +810,7 @@ class ElevenLabsTTSService(WebsocketTTSService):
         finally:
             await self.remove_active_audio_context()
             self._websocket = None
+            self._context_init_sent.clear()
             await self._call_event_handler("on_disconnected")
 
     def _get_websocket(self):
@@ -822,6 +841,7 @@ class ElevenLabsTTSService(WebsocketTTSService):
         self._partial_word = ""
         self._partial_word_start_time = 0.0
         self._alignment_started_context_ids.discard(context_id)
+        self._context_init_sent.discard(context_id)
 
     async def on_audio_context_interrupted(self, context_id: str):
         """Close the ElevenLabs context when the bot is interrupted."""
@@ -890,7 +910,17 @@ class ElevenLabsTTSService(WebsocketTTSService):
                 )
 
                 if word_times:
-                    await self.add_word_timestamps(word_times, received_ctx_id)
+                    await self.add_word_timestamps(
+                        word_times,
+                        received_ctx_id,
+                        includes_inter_frame_spaces=(
+                            True
+                            if _word_timestamps_include_inter_frame_spaces(
+                                assert_given(self._settings.language)
+                            )
+                            else None
+                        ),
+                    )
 
                     # Calculate the actual end time of this audio chunk
                     char_start_times_ms = alignment.get("charStartTimesMs", [])
@@ -914,25 +944,34 @@ class ElevenLabsTTSService(WebsocketTTSService):
         while True:
             await asyncio.sleep(KEEPALIVE_SLEEP)
             try:
-                if self._websocket and self._websocket.state is State.OPEN:
-                    context_id = self.get_active_audio_context_id()
-                    if context_id:
-                        # Send keepalive with context ID to keep the connection alive
-                        keepalive_message = {
-                            "text": "",
-                            "context_id": context_id,
-                        }
-                        logger.trace(f"Sending keepalive for context {context_id}")
-                    else:
-                        # It's possible to have a user interruption which clears the context
-                        # without generating a new TTS response. In this case, we'll just send
-                        # an empty message to keep the connection alive.
-                        keepalive_message = {"text": ""}
-                        logger.trace("Sending keepalive without context")
-                    await self._websocket.send(json.dumps(keepalive_message))
+                await self._send_keepalive()
             except websockets.ConnectionClosed as e:
                 logger.warning(f"{self} keepalive error: {e}")
                 break
+
+    async def _send_keepalive(self):
+        """Send a single keepalive message to keep the WebSocket connection alive.
+
+        Only stamps a ``context_id`` once its context-init (carrying
+        ``voice_settings``) has been sent. Otherwise the keepalive would be the
+        context's first message, with no ``voice_settings``, and ElevenLabs would
+        reject the later context-init with a 1008 policy violation. A context-less
+        keepalive is sufficient until the context-init is sent.
+        """
+        if not self._websocket or self._websocket.state is not State.OPEN:
+            return
+
+        context_id = self.get_active_audio_context_id()
+        if context_id and context_id in self._context_init_sent:
+            # The context's voice_settings context-init has been sent, so it's
+            # safe to keep that context alive.
+            keepalive_message = {"text": "", "context_id": context_id}
+        else:
+            # No active context, or the active context's context-init hasn't been
+            # sent yet. A context-less keepalive keeps the connection alive without
+            # opening the context prematurely.
+            keepalive_message = {"text": ""}
+        await self._websocket.send(json.dumps(keepalive_message))
 
     async def _send_text(self, text: str, context_id: str):
         """Send text to the WebSocket for synthesis."""
@@ -980,6 +1019,9 @@ class ElevenLabsTTSService(WebsocketTTSService):
                             locator.model_dump()
                             for locator in self._pronunciation_dictionary_locators
                         ]
+                    # Mark the context-init as sent so the keepalive may now
+                    # target this context_id.
+                    self._context_init_sent.add(context_id)
                     await self._websocket.send(json.dumps(msg))
                     logger.trace(f"Created new context {context_id}")
 
@@ -1005,11 +1047,16 @@ class ElevenLabsHttpTTSService(TTSService):
     Settings = ElevenLabsHttpTTSSettings
     _settings: Settings
 
+    @deprecated(
+        "`ElevenLabsHttpTTSService.InputParams` is deprecated since 0.0.105 and will be removed "
+        "in 2.0.0. Use `ElevenLabsHttpTTSService.Settings` instead."
+    )
     class InputParams(BaseModel):
         """Input parameters for ElevenLabs HTTP TTS configuration.
 
         .. deprecated:: 0.0.105
             Use ``settings=ElevenLabsHttpTTSService.Settings(...)`` instead.
+            Will be removed in 2.0.0.
 
         Parameters:
             language: Language to use for synthesis.
@@ -1058,12 +1105,14 @@ class ElevenLabsHttpTTSService(TTSService):
 
                 .. deprecated:: 0.0.105
                     Use ``settings=ElevenLabsHttpTTSService.Settings(voice=...)`` instead.
+                    Will be removed in 2.0.0.
 
             aiohttp_session: aiohttp ClientSession for HTTP requests.
             model: TTS model to use (e.g., "eleven_turbo_v2_5").
 
                 .. deprecated:: 0.0.105
                     Use ``settings=ElevenLabsHttpTTSService.Settings(model=...)`` instead.
+                    Will be removed in 2.0.0.
 
             base_url: Base URL for ElevenLabs HTTP API.
             sample_rate: Audio sample rate. If None, uses default.
@@ -1075,6 +1124,7 @@ class ElevenLabsHttpTTSService(TTSService):
 
                 .. deprecated:: 0.0.105
                     Use ``settings=ElevenLabsHttpTTSService.Settings(...)`` instead.
+                    Will be removed in 2.0.0.
 
             settings: Runtime-updatable settings. When provided alongside deprecated
                 parameters, ``settings`` values take precedence.
@@ -1083,6 +1133,7 @@ class ElevenLabsHttpTTSService(TTSService):
 
                 .. deprecated:: 0.0.104
                     Use ``text_aggregation_mode`` instead.
+                    Will be removed in 2.0.0.
 
             **kwargs: Additional arguments passed to the parent service.
         """
@@ -1420,7 +1471,17 @@ class ElevenLabsHttpTTSService(TTSService):
                             # Calculate word timestamps
                             word_times = self.calculate_word_times(alignment)
                             if word_times:
-                                await self.add_word_timestamps(word_times, context_id)
+                                await self.add_word_timestamps(
+                                    word_times,
+                                    context_id,
+                                    includes_inter_frame_spaces=(
+                                        True
+                                        if _word_timestamps_include_inter_frame_spaces(
+                                            assert_given(self._settings.language)
+                                        )
+                                        else None
+                                    ),
+                                )
                     except json.JSONDecodeError as e:
                         logger.warning(f"Failed to parse JSON from stream: {e}")
                         continue
@@ -1432,7 +1493,17 @@ class ElevenLabsHttpTTSService(TTSService):
                 # since this is the end of the utterance
                 if self._partial_word:
                     final_word_time = [(self._partial_word, self._partial_word_start_time)]
-                    await self.add_word_timestamps(final_word_time, context_id)
+                    await self.add_word_timestamps(
+                        final_word_time,
+                        context_id,
+                        includes_inter_frame_spaces=(
+                            True
+                            if _word_timestamps_include_inter_frame_spaces(
+                                assert_given(self._settings.language)
+                            )
+                            else None
+                        ),
+                    )
                     self._partial_word = ""
                     self._partial_word_start_time = 0.0
 

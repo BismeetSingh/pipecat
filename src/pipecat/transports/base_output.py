@@ -96,8 +96,8 @@ class BaseOutputTransport(FrameProcessor):
             with warnings.catch_warnings():
                 warnings.simplefilter("always")
                 warnings.warn(
-                    "Transport parameter `video_out_bitrate` is deprecated and will be removed in a future "
-                    "version. Use provider specific settings instead.",
+                    "Transport parameter `video_out_bitrate` is deprecated and will be removed in "
+                    "2.0.0. Use provider specific settings instead.",
                     DeprecationWarning,
                     stacklevel=2,
                 )
@@ -448,6 +448,9 @@ class BaseOutputTransport(FrameProcessor):
             self._video_task: asyncio.Task | None = None
             self._clock_task: asyncio.Task | None = None
 
+            # If timestamps are equal, use this count to preserve the insertion order
+            self._clock_queue_counter = itertools.count()
+
         @property
         def sample_rate(self) -> int:
             """Get the audio sample rate.
@@ -498,7 +501,7 @@ class BaseOutputTransport(FrameProcessor):
                 frame: The end frame signaling sender shutdown.
             """
             # Let the sink tasks process the queue until they reach this EndFrame.
-            await self._clock_queue.put((float("inf"), frame.id, frame))
+            await self._clock_queue.put((float("inf"), next(self._clock_queue_counter), frame))
             await self._audio_queue.put(frame)
 
             # At this point we have enqueued an EndFrame and we need to wait for
@@ -542,9 +545,13 @@ class BaseOutputTransport(FrameProcessor):
             await self._cancel_clock_task()
             await self._cancel_video_task()
 
-            if self._audio_queue.has_uninterruptible:
+            if self._audio_queue.has_uninterruptible or self._mixer:
                 # Keep the audio task running but drain all interruptible frames
-                # so the pending UninterruptibleFrames are still delivered.
+                # so the pending UninterruptibleFrames are still delivered. With
+                # a mixer, cancelling the task would also stop mixer-only output
+                # during the restart, causing an audible gap in the background
+                # audio (made worse by telephony serializers that clear the
+                # playout buffer on interruptions).
                 self._audio_queue.reset()
             else:
                 await self._cancel_audio_task()
@@ -610,7 +617,7 @@ class BaseOutputTransport(FrameProcessor):
             Args:
                 frame: The frame with timing information to handle.
             """
-            await self._clock_queue.put((frame.pts, frame.id, frame))
+            await self._clock_queue.put((frame.pts, next(self._clock_queue_counter), frame))
 
         async def handle_sync_frame(self, frame: Frame):
             """Handle frames that need synchronized processing.
@@ -816,7 +823,13 @@ class BaseOutputTransport(FrameProcessor):
             silence_frame = OutputAudioRawFrame(
                 audio=silence, sample_rate=self.sample_rate, num_channels=1
             )
-            await self._transport.write_audio_frame(silence_frame)
+            try:
+                await asyncio.wait_for(
+                    self._transport.write_audio_frame(silence_frame),
+                    timeout=secs + 1,
+                )
+            except TimeoutError:
+                logger.warning(f"{self} timed out writing end-frame silence")
 
         async def _audio_task_handler(self):
             """Main audio processing task handler."""
@@ -945,7 +958,7 @@ class BaseOutputTransport(FrameProcessor):
                     resized_image = image.resize(desired_size)
                     # logger.warning(f"{frame} does not have the expected size {desired_size}, resizing")
                     frame = OutputImageRawFrame(
-                        resized_image.tobytes(), resized_image.size, resized_image.format
+                        resized_image.tobytes(), resized_image.size, resized_image.mode
                     )
 
                 return frame

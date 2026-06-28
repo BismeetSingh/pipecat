@@ -23,7 +23,6 @@ from enum import Enum
 from typing import (
     TYPE_CHECKING,
     Any,
-    Optional,
 )
 
 from loguru import logger
@@ -40,6 +39,7 @@ from pipecat.frames.frames import (
     InterruptionFrame,
     StartFrame,
     SystemFrame,
+    TTSAudioRawFrame,
     UninterruptibleFrame,
 )
 from pipecat.metrics.metrics import LLMTokenUsage, MetricsData
@@ -47,10 +47,11 @@ from pipecat.observers.base_observer import BaseObserver, FrameProcessed, FrameP
 from pipecat.processors.metrics.frame_processor_metrics import FrameProcessorMetrics
 from pipecat.utils.asyncio.task_manager import BaseTaskManager
 from pipecat.utils.base_object import BaseObject
+from pipecat.utils.deprecation import deprecated
 from pipecat.utils.frame_queue import FrameQueue
 
 if TYPE_CHECKING:
-    from pipecat.pipeline.task import PipelineTask
+    from pipecat.pipeline.worker import PipelineWorker
 
 
 class FrameDirection(Enum):
@@ -75,31 +76,30 @@ class FrameProcessorSetup:
     Parameters:
         clock: The clock instance for timing operations.
         task_manager: The task manager for handling async operations.
+        pipeline_worker: The :class:`PipelineWorker` running this pipeline. Stored
+            on each processor as ``self.pipeline_worker`` so processors can
+            reach task-scoped state (e.g. ``self.pipeline_worker.app_resources``).
         observer: Optional observer for monitoring frame processing events.
-        pipeline_task: The :class:`PipelineTask` running this pipeline. Stored
-            on each processor as ``self.pipeline_task`` so processors can
-            reach task-scoped state (e.g. ``self.pipeline_task.app_resources``).
-        tool_resources: Deprecated. :class:`PipelineTask` continues to populate
+        tool_resources: Deprecated. :class:`PipelineWorker` continues to populate
             this with ``app_resources`` so that custom :class:`FrameProcessor`
             subclasses whose ``setup()`` overrides read ``setup.tool_resources``
             keep working. New code should read
-            ``setup.pipeline_task.app_resources`` instead.
+            ``setup.pipeline_worker.app_resources`` instead.
 
             .. deprecated:: 1.2.0
-                Reading this attribute emits a ``DeprecationWarning``. Read
-                ``setup.pipeline_task.app_resources`` instead.
-                ``tool_resources`` will be removed in a future version.
+                Read ``setup.pipeline_worker.app_resources`` instead. Will be
+                removed in 2.0.0.
     """
 
     clock: BaseClock
     task_manager: BaseTaskManager
+    pipeline_worker: PipelineWorker
     observer: BaseObserver | None = None
-    pipeline_task: PipelineTask | None = None
     tool_resources: Any = None
 
     def __getattribute__(self, name: str) -> Any:
         # Warn when user code reads the deprecated ``tool_resources`` field.
-        # Set is unaffected (goes through ``__setattr__``), so PipelineTask can
+        # Set is unaffected (goes through ``__setattr__``), so PipelineWorker can
         # populate it for backwards compat without tripping the warning.
         if name == "tool_resources":
             value = object.__getattribute__(self, "tool_resources")
@@ -108,7 +108,7 @@ class FrameProcessorSetup:
                     warnings.simplefilter("always")
                     warnings.warn(
                         "`FrameProcessorSetup.tool_resources` is deprecated since 1.2.0; "
-                        "read `setup.pipeline_task.app_resources` instead.",
+                        "read `setup.pipeline_worker.app_resources` instead.",
                         DeprecationWarning,
                         stacklevel=2,
                     )
@@ -134,7 +134,7 @@ class FrameProcessorQueue(asyncio.PriorityQueue):
         self.__high_counter = 0
         self.__low_counter = 0
 
-    async def put(self, item: tuple[Frame, FrameDirection, FrameCallback]):
+    async def put(self, item: tuple[Frame, FrameDirection, FrameCallback | None]):
         """Put an item into the priority queue.
 
         System frames (`SystemFrame`) have higher priority than any other
@@ -220,8 +220,9 @@ class FrameProcessor(BaseObject):
         # Observer
         self._observer: BaseObserver | None = None
 
-        # Pipeline Task
-        self._pipeline_task: PipelineTask | None = None
+        # Pipeline Task. Populated by ``setup()``; accessing the
+        # ``pipeline_worker`` property before setup raises.
+        self._pipeline_worker: PipelineWorker | None = None  # set in setup()
 
         # Other properties
         self._enable_metrics = False
@@ -366,20 +367,32 @@ class FrameProcessor(BaseObject):
         return self._report_only_initial_ttfb
 
     @property
-    def pipeline_task(self) -> PipelineTask | None:
-        """Get the :class:`PipelineTask` this processor is running in.
+    def pipeline_worker(self) -> PipelineWorker:
+        """Get the :class:`PipelineWorker` this processor is running in.
 
-        Provides access to task-scoped state from inside a processor — most
-        notably ``self.pipeline_task.app_resources`` for the application's
+        Provides access to worker-scoped state from inside a processor — most
+        notably ``self.pipeline_worker.app_resources`` for the application's
         shared bag of resources (DB handles, clients, feature flags, etc.).
 
         Returns:
-            The :class:`PipelineTask` instance that set up this processor,
-            or ``None`` if the processor has not yet been set up by one
-            (for example, before the task has started, or when the processor
-            was instantiated in isolation).
+            The :class:`PipelineWorker` instance that set up this processor.
         """
-        return self._pipeline_task
+        if not self._pipeline_worker:
+            raise Exception(f"{self} pipeline worker is still not set.")
+        return self._pipeline_worker
+
+    @property
+    @deprecated(
+        "`FrameProcessor.pipeline_task` is deprecated since 1.3.0 and will be removed in 2.0.0. "
+        "Use `pipeline_worker` instead."
+    )
+    def pipeline_task(self) -> PipelineWorker:
+        """Deprecated alias for :attr:`pipeline_worker`.
+
+        .. deprecated:: 1.3.0
+            Use :attr:`pipeline_worker` instead. Will be removed in 2.0.0.
+        """
+        return self.pipeline_worker
 
     def processors_with_metrics(self):
         """Return processors that can generate metrics.
@@ -431,6 +444,24 @@ class FrameProcessor(BaseObject):
             frame = await self._metrics.stop_ttfb_metrics(end_time=end_time)
             if frame:
                 await self.push_frame(frame)
+
+    async def process_ttfa_metrics(self, frame: TTSAudioRawFrame):
+        """Scan a TTS audio frame for the first audible sample and push TTFA.
+
+        Should be called for every audio frame until a measurement is produced;
+        the metrics collector tracks leading silence across chunks internally.
+
+        Args:
+            frame: The TTS audio frame to inspect.
+        """
+        if self.can_generate_metrics() and self.metrics_enabled:
+            metrics_frame = await self._metrics.process_ttfa_metrics(
+                audio=frame.audio,
+                sample_rate=frame.sample_rate,
+                num_channels=frame.num_channels,
+            )
+            if metrics_frame:
+                await self.push_frame(metrics_frame)
 
     async def start_processing_metrics(self, *, start_time: float | None = None):
         """Start processing metrics collection.
@@ -503,7 +534,7 @@ class FrameProcessor(BaseObject):
         await super().setup(setup.task_manager)
         self._clock = setup.clock
         self._observer = setup.observer
-        self._pipeline_task = setup.pipeline_task
+        self._pipeline_worker = setup.pipeline_worker
 
         # Create processing tasks.
         self.__create_input_task()
@@ -708,24 +739,18 @@ class FrameProcessor(BaseObject):
         await self.stop_all_metrics()
         await self.broadcast_frame(InterruptionFrame)
 
+    @deprecated(
+        "`FrameProcessor.push_interruption_task_frame_and_wait` is deprecated since 0.0.104 "
+        "and will be removed in 2.0.0. Use `broadcast_interruption` instead."
+    )
     async def push_interruption_task_frame_and_wait(self, *, timeout: float = 5.0):
         """Push an interruption task frame upstream and wait for the interruption.
 
         .. deprecated:: 0.0.104
             Use :meth:`broadcast_interruption` instead. This method now
             delegates to ``broadcast_interruption()`` and ignores *timeout*.
+            Will be removed in 2.0.0.
         """
-        import warnings
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("always")
-            warnings.warn(
-                "`FrameProcessor.push_interruption_task_frame_and_wait()` is deprecated. "
-                "Use `FrameProcessor.broadcast_interruption()` instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-
         await self.broadcast_interruption()
 
     async def broadcast_frame(self, frame_cls: type[Frame], **kwargs):
